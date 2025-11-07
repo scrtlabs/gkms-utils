@@ -58,7 +58,7 @@ func createServiceAccount(ctx context.Context, iamService *iam.Service, vmid str
 	return sa, nil
 }
 
-func createAndStoreSecret(ctx context.Context, smClient *secretmanager.Client, vmid, secretName, payload string) (string, error) {
+func createAndStoreSecret(ctx context.Context, smClient *secretmanager.Client, vmid, secretName, payload string, newPassphrase bool) (string, error) {
 	secretID := gkms.GetSecretID(vmid, secretName)
 	if secretID == "" {
 		return "", fmt.Errorf("unknown secret short name: %s", secretName)
@@ -91,7 +91,7 @@ func createAndStoreSecret(ctx context.Context, smClient *secretmanager.Client, v
 			return "", fmt.Errorf("failed to get existing secret %s: %w", secretID, err)
 		}
 		// Do not regenerate secretPasshprase
-		if secretName == gkms.SecretPassphraseName {
+		if secretName == gkms.SecretPassphraseName && !newPassphrase {
 			return secret.Name, nil
 		}
 	}
@@ -210,7 +210,7 @@ func deleteSecret(ctx context.Context, smClient *secretmanager.Client, vmid, sec
 	return nil
 }
 
-func createVM(ctx context.Context, smClient *secretmanager.Client, iamService *iam.Service, vmid, env, dockerCreds string) error {
+func createVM(ctx context.Context, smClient *secretmanager.Client, iamService *iam.Service, newPassphrase bool, vmid, env, dockerCreds string) error {
 	sa, err := createServiceAccount(ctx, iamService, vmid)
 	if err != nil {
 		return err
@@ -222,7 +222,7 @@ func createVM(ctx context.Context, smClient *secretmanager.Client, iamService *i
 	if err != nil {
 		return fmt.Errorf("failed to generate passphrase: %w", err)
 	}
-	passSecretName, err := createAndStoreSecret(ctx, smClient, vmid, gkms.SecretPassphraseName, passphrase)
+	passSecretName, err := createAndStoreSecret(ctx, smClient, vmid, gkms.SecretPassphraseName, passphrase, newPassphrase)
 	if err != nil {
 		return err
 	}
@@ -232,7 +232,7 @@ func createVM(ctx context.Context, smClient *secretmanager.Client, iamService *i
 	log.Printf("Stored and granted access to %s", gkms.SecretPassphraseName)
 
 	if env != "" {
-		envSecretName, err := createAndStoreSecret(ctx, smClient, vmid, gkms.SecretEnvName, env)
+		envSecretName, err := createAndStoreSecret(ctx, smClient, vmid, gkms.SecretEnvName, env, false)
 		if err != nil {
 			return err
 		}
@@ -245,7 +245,7 @@ func createVM(ctx context.Context, smClient *secretmanager.Client, iamService *i
 	}
 
 	if dockerCreds != "" {
-		dockerSecretName, err := createAndStoreSecret(ctx, smClient, vmid, gkms.SecretDockerName, dockerCreds)
+		dockerSecretName, err := createAndStoreSecret(ctx, smClient, vmid, gkms.SecretDockerName, dockerCreds, false)
 		if err != nil {
 			return err
 		}
@@ -288,6 +288,7 @@ func main() {
 	keyFile := flag.String("key", "", "Path to the manager's admin service account key file")
 	vmUID := flag.String("vm-uid", "", "Unique ID for the VM")
 	env := flag.String("env", "", "Environment string payload (for 'create' op)")
+	newPassphrase := flag.Bool("new-passphrase", false, "Regenerate passhprase")
 	dockerCreds := flag.String("docker", "", "Docker credentials payload (for 'create' op)")
 
 	flag.Parse()
@@ -311,7 +312,7 @@ func main() {
 
 	switch *op {
 	case "create":
-		err := createVM(ctx, smClient, iamService, *vmUID, *env, *dockerCreds)
+		err := createVM(ctx, smClient, iamService, *newPassphrase, *vmUID, *env, *dockerCreds)
 		if err != nil {
 			log.Fatalf("Failed to create VM resources: %v", err)
 		}

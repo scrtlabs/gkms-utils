@@ -20,10 +20,6 @@ import (
 	iampb "google.golang.org/genproto/googleapis/iam/v1"
 )
 
-func getServiceAccountID(vmid string) string {
-	return fmt.Sprintf("vm-%s", vmid)
-}
-
 func generateRandomKey(size int) (string, error) {
 	keyBytes := make([]byte, size)
 	_, err := rand.Read(keyBytes)
@@ -34,7 +30,7 @@ func generateRandomKey(size int) (string, error) {
 }
 
 func createServiceAccount(ctx context.Context, iamService *iam.Service, vmid string) (*iam.ServiceAccount, error) {
-	accountID := getServiceAccountID(vmid)
+	accountID := gkms.GetServiceAccountID(vmid)
 	saName := fmt.Sprintf("projects/%s/serviceAccounts/%s@%s.iam.gserviceaccount.com", gkms.ProjectID, accountID, gkms.ProjectID)
 
 	sa, err := iamService.Projects.ServiceAccounts.Get(saName).Context(ctx).Do()
@@ -175,7 +171,7 @@ func createAndSaveKeyFile(ctx context.Context, iamService *iam.Service, saEmail,
 }
 
 func deleteServiceAccount(ctx context.Context, iamService *iam.Service, vmid string) error {
-	accountID := getServiceAccountID(vmid)
+	accountID := gkms.GetServiceAccountID(vmid)
 	saName := fmt.Sprintf("projects/%s/serviceAccounts/%s@%s.iam.gserviceaccount.com", gkms.ProjectID, accountID, gkms.ProjectID)
 
 	_, err := iamService.Projects.ServiceAccounts.Delete(saName).Context(ctx).Do()

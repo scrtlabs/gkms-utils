@@ -10,15 +10,26 @@ const (
 	KeyFilePermission    = 0600
 )
 
+func GetServiceAccountID(vmid string) string {
+	id := fmt.Sprintf("vm-%s", vmid)
+
+	if len(id) > 30 {
+		return id[:30]
+	}
+
+	return id
+}
+
 func GetSecretID(vmid string, secretName string) string {
+	serviceAccountId := GetServiceAccountID(vmid)
 	if secretName == SecretPassphraseName {
-		return fmt.Sprintf("vm-%s-passphrase", vmid)
+		return fmt.Sprintf("%s-passphrase", serviceAccountId)
 	}
 	if secretName == SecretEnvName {
-		return fmt.Sprintf("vm-%s-env", vmid)
+		return fmt.Sprintf("%s-env", serviceAccountId)
 	}
 	if secretName == SecretDockerName {
-		return fmt.Sprintf("vm-%s-docker", vmid)
+		return fmt.Sprintf("%s-docker", serviceAccountId)
 	}
 	return ""
 }

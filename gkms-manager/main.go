@@ -311,6 +311,10 @@ func main() {
 		err := createVM(ctx, smClient, iamService, *newPassphrase, *vmUID, *env, *dockerCreds)
 		if err != nil {
 			log.Fatalf("Failed to create VM resources: %v", err)
+		} else {
+			log.Printf("Finalizing...")
+			time.Sleep(5 * time.Second)
+			log.Printf("Done.")
 		}
 
 	case "delete":

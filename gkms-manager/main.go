@@ -4,15 +4,20 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/base64"
+	"errors"
 	"flag"
 	"fmt"
 	"log"
+	"net/http"
 	"os"
 	"strings"
 	"time"
 
+	"google.golang.org/api/googleapi"
 	iam "google.golang.org/api/iam/v1"
 	"google.golang.org/api/option"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 
 	secretmanager "cloud.google.com/go/secretmanager/apiv1"
 	"cloud.google.com/go/secretmanager/apiv1/secretmanagerpb"
@@ -29,14 +34,14 @@ func generateRandomKey(size int) (string, error) {
 	return base64.StdEncoding.EncodeToString(keyBytes), nil
 }
 
-func createServiceAccount(ctx context.Context, iamService *iam.Service, vmid string) (*iam.ServiceAccount, error) {
+func createServiceAccount(ctx context.Context, iamService *iam.Service, vmid string) (*iam.ServiceAccount, bool, error) {
 	accountID := gkms.GetServiceAccountID(vmid)
 	saName := fmt.Sprintf("projects/%s/serviceAccounts/%s@%s.iam.gserviceaccount.com", gkms.ProjectID, accountID, gkms.ProjectID)
 
 	sa, err := iamService.Projects.ServiceAccounts.Get(saName).Context(ctx).Do()
 	if err == nil {
 		log.Printf("Service account %s already exists", sa.Email)
-		return sa, nil
+		return sa, false, nil
 	}
 
 	req := &iam.CreateServiceAccountRequest{
@@ -48,10 +53,10 @@ func createServiceAccount(ctx context.Context, iamService *iam.Service, vmid str
 	}
 	sa, err = iamService.Projects.ServiceAccounts.Create(fmt.Sprintf("projects/%s", gkms.ProjectID), req).Context(ctx).Do()
 	if err != nil {
-		return nil, fmt.Errorf("failed to create service account: %w", err)
+		return nil, false, fmt.Errorf("failed to create service account: %w", err)
 	}
 	log.Printf("Created Service Account: %s", sa.Email)
-	return sa, nil
+	return sa, true, nil
 }
 
 func createAndStoreSecret(ctx context.Context, smClient *secretmanager.Client, vmid, secretName, payload string, newPassphrase bool) (string, error) {
@@ -107,51 +112,61 @@ func createAndStoreSecret(ctx context.Context, smClient *secretmanager.Client, v
 }
 
 func grantSecretAccess(ctx context.Context, smClient *secretmanager.Client, secretFullName, saEmail string) error {
-	policy, err := smClient.GetIamPolicy(ctx, &iampb.GetIamPolicyRequest{
-		Resource: secretFullName,
-	})
-	if err != nil {
-		return fmt.Errorf("failed to get IAM policy for secret: %w", err)
-	}
+	return retryWhileSAPropagates(fmt.Sprintf("grant %s access to %s", saEmail, secretFullName), func() error {
+		policy, err := smClient.GetIamPolicy(ctx, &iampb.GetIamPolicyRequest{
+			Resource: secretFullName,
+		})
+		if err != nil {
+			return fmt.Errorf("failed to get IAM policy for secret: %w", err)
+		}
 
-	saMember := "serviceAccount:" + saEmail
-	role := "roles/secretmanager.secretAccessor"
+		saMember := "serviceAccount:" + saEmail
+		role := "roles/secretmanager.secretAccessor"
 
-	for _, binding := range policy.Bindings {
-		if binding.Role == role {
-			for _, member := range binding.Members {
-				if member == saMember {
-					log.Printf("SA %s already has access to %s.", saEmail, secretFullName)
-					return nil
+		for _, binding := range policy.Bindings {
+			if binding.Role == role {
+				for _, member := range binding.Members {
+					if member == saMember {
+						log.Printf("SA %s already has access to %s.", saEmail, secretFullName)
+						return nil
+					}
 				}
 			}
 		}
-	}
 
-	policy.Bindings = append(policy.Bindings, &iampb.Binding{
-		Role:    role,
-		Members: []string{saMember},
+		policy.Bindings = append(policy.Bindings, &iampb.Binding{
+			Role:    role,
+			Members: []string{saMember},
+		})
+
+		setPolicyReq := &iampb.SetIamPolicyRequest{
+			Resource: secretFullName,
+			Policy:   policy,
+		}
+		if _, err := smClient.SetIamPolicy(ctx, setPolicyReq); err != nil {
+			return fmt.Errorf("failed to set IAM policy for secret: %w", err)
+		}
+
+		log.Printf("Granted SA %s access to %s.", saEmail, secretFullName)
+		return nil
 	})
-
-	setPolicyReq := &iampb.SetIamPolicyRequest{
-		Resource: secretFullName,
-		Policy:   policy,
-	}
-	if _, err := smClient.SetIamPolicy(ctx, setPolicyReq); err != nil {
-		return fmt.Errorf("failed to set IAM policy for secret: %w", err)
-	}
-
-	log.Printf("Granted SA %s access to %s.", saEmail, secretFullName)
-	return nil
 }
 
 func createAndSaveKeyFile(ctx context.Context, iamService *iam.Service, saEmail, vmid string) error {
 	saName := fmt.Sprintf("projects/-/serviceAccounts/%s", saEmail)
 	keyReq := &iam.CreateServiceAccountKeyRequest{}
 
-	key, err := iamService.Projects.ServiceAccounts.Keys.Create(saName, keyReq).Context(ctx).Do()
+	var key *iam.ServiceAccountKey
+	err := retryWhileSAPropagates(fmt.Sprintf("create key for %s", saEmail), func() error {
+		k, err := iamService.Projects.ServiceAccounts.Keys.Create(saName, keyReq).Context(ctx).Do()
+		if err != nil {
+			return fmt.Errorf("failed to create service account key: %w", err)
+		}
+		key = k
+		return nil
+	})
 	if err != nil {
-		return fmt.Errorf("failed to create service account key: %w", err)
+		return err
 	}
 
 	keyData, err := base64.StdEncoding.DecodeString(key.PrivateKeyData)
@@ -207,12 +222,13 @@ func deleteSecret(ctx context.Context, smClient *secretmanager.Client, vmid, sec
 }
 
 func createVM(ctx context.Context, smClient *secretmanager.Client, iamService *iam.Service, newPassphrase bool, vmid, env, dockerCreds string) error {
-	sa, err := createServiceAccount(ctx, iamService, vmid)
+	sa, created, err := createServiceAccount(ctx, iamService, vmid)
 	if err != nil {
 		return err
 	}
-	// Small delay to allow SA to propagate before setting IAM
-	time.Sleep(2 * time.Second)
+	if created {
+		time.Sleep(2 * time.Second)
+	}
 
 	passphrase, err := generateRandomKey(32)
 	if err != nil {
@@ -328,11 +344,51 @@ func main() {
 	}
 }
 
-// --- gRPC Error Helpers ---
+func retryWhileSAPropagates(what string, fn func() error) error {
+	const maxAttempts = 7
+	delay := 2 * time.Second
+
+	var err error
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		err = fn()
+		if err == nil || !isSAPropagationError(err) {
+			return err
+		}
+		if attempt == maxAttempts {
+			break
+		}
+		log.Printf("%s: service account not visible yet (attempt %d/%d), retrying in %s", what, attempt, maxAttempts, delay)
+		time.Sleep(delay)
+		if delay < 15*time.Second {
+			delay *= 2
+		}
+	}
+	return fmt.Errorf("%s: service account still not visible after %d attempts: %w", what, maxAttempts, err)
+}
+
+func isSAPropagationError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "service account") && strings.Contains(msg, "does not exist")
+}
+
 func isAlreadyExists(err error) bool {
-	return err != nil && strings.Contains(err.Error(), "rpc error: code = AlreadyExists desc = Secret")
+	return hasErrorCode(err, codes.AlreadyExists, http.StatusConflict)
 }
 
 func isNotFound(err error) bool {
-	return err != nil && (strings.Contains(err.Error(), "rpc error: code = NotFound desc = Secret") || strings.Contains(err.Error(), "rpc error: code = NotFound desc = Service account"))
+	return hasErrorCode(err, codes.NotFound, http.StatusNotFound)
+}
+
+func hasErrorCode(err error, grpcCode codes.Code, httpCode int) bool {
+	if err == nil {
+		return false
+	}
+	if status.Code(err) == grpcCode {
+		return true
+	}
+	var apiErr *googleapi.Error
+	return errors.As(err, &apiErr) && apiErr.Code == httpCode
 }

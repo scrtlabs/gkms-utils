@@ -10,6 +10,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"sort"
 	"strings"
 	"time"
 
@@ -152,15 +153,78 @@ func grantSecretAccess(ctx context.Context, smClient *secretmanager.Client, secr
 	})
 }
 
+// keysToRetain is how many existing user-managed keys survive a prune, before
+// the new one is minted. Google caps a service account at 10 user-managed keys
+// and answers the 11th create with "Error 400: Precondition check failed.,
+// failedPrecondition" -- so without pruning a VM simply stops being updatable
+// once it has been updated ten times.
+//
+// One is enough: every launch hands the VM a freshly minted key, so older ones
+// are dead weight. Keeping one means a create that fails after the prune still
+// leaves the VM with a usable key instead of none.
+const keysToRetain = 1
+
+// pruneServiceAccountKeys deletes the oldest user-managed keys, keeping at most
+// keysToRetain of them, so there is always room for a new key.
+//
+// It must run BEFORE the key is created: an account that is already at the cap
+// can never recover if pruning only happens afterwards.
+//
+// Google-managed keys are skipped -- they cannot be deleted and do not count
+// towards the cap.
+func pruneServiceAccountKeys(ctx context.Context, iamService *iam.Service, saEmail string) error {
+	saName := fmt.Sprintf("projects/-/serviceAccounts/%s", saEmail)
+
+	list, err := iamService.Projects.ServiceAccounts.Keys.List(saName).
+		KeyTypes("USER_MANAGED").Context(ctx).Do()
+	if err != nil {
+		return fmt.Errorf("failed to list service account keys: %w", err)
+	}
+
+	keys := list.Keys
+	if len(keys) <= keysToRetain {
+		log.Printf("Service account %s holds %d user-managed key(s); nothing to prune.", saEmail, len(keys))
+		return nil
+	}
+
+	// Newest first, so the ones we keep are the most recently issued.
+	sort.Slice(keys, func(i, j int) bool {
+		return keys[i].ValidAfterTime > keys[j].ValidAfterTime
+	})
+
+	var failed int
+	for _, key := range keys[keysToRetain:] {
+		if _, err := iamService.Projects.ServiceAccounts.Keys.Delete(key.Name).Context(ctx).Do(); err != nil {
+			// Losing one deletion is not fatal: the create below may still have
+			// room, and its own error is the one worth surfacing.
+			log.Printf("Warning: could not delete stale key %s: %v", key.Name, err)
+			failed++
+			continue
+		}
+		log.Printf("Deleted stale key %s (issued %s)", key.Name, key.ValidAfterTime)
+	}
+
+	log.Printf("Pruned %d of %d user-managed key(s) on %s, retained %d.",
+		len(keys)-keysToRetain-failed, len(keys), saEmail, keysToRetain+failed)
+	return nil
+}
+
 func createAndSaveKeyFile(ctx context.Context, iamService *iam.Service, saEmail, vmid string) error {
 	saName := fmt.Sprintf("projects/-/serviceAccounts/%s", saEmail)
+
+	// Make room first; see pruneServiceAccountKeys for why this cannot wait
+	// until after the create.
+	if err := pruneServiceAccountKeys(ctx, iamService, saEmail); err != nil {
+		log.Printf("Warning: key prune failed, attempting create anyway: %v", err)
+	}
+
 	keyReq := &iam.CreateServiceAccountKeyRequest{}
 
 	var key *iam.ServiceAccountKey
 	err := retryWhileSAPropagates(fmt.Sprintf("create key for %s", saEmail), func() error {
 		k, err := iamService.Projects.ServiceAccounts.Keys.Create(saName, keyReq).Context(ctx).Do()
 		if err != nil {
-			return fmt.Errorf("failed to create service account key: %w", err)
+			return fmt.Errorf("failed to create service account key (service accounts are capped at 10 user-managed keys; prune may have failed): %w", err)
 		}
 		key = k
 		return nil
